@@ -1,0 +1,2222 @@
+
+C 
+// =========================================================
+//  domoserver.c - Serveur HTTP Windows + SQLite pour Domo-Connect
+//  Compilation : gcc domoserver.c sqlite3.c -o domoserver.exe -lws2_32 -lsqlite3
+// =========================================================
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <sqlite3.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+#define PORT 8080
+#define DB_FILE "etat_appareils.db"
+#define RECV_BUF 8192
+
+// =========================================================
+// UTILITAIRES
+// =========================================================
+void url_decode(char *dst, const char *src) {
+    char a, b;
+    while (*src) {
+        if (*src == '%') {
+            a = src[1]; b = src[2];
+            if (a && b) {
+                int val = (int)strtol((char[]){a, b, 0}, NULL, 16);
+                *dst++ = (char)val;
+                src += 3;
+            } else src++;
+        } else if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+        } else *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
+void send_file_response(SOCKET sock, const char *filename, const char *extra_message) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) {
+        const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<h1>404 - Page non trouvée</h1>";
+        send(sock, nf, (int)strlen(nf), 0);
+        return;
+    }
+
+    static char buffer[32768];
+    size_t n = fread(buffer, 1, sizeof(buffer)-1, f);
+    buffer[n] = '\0';
+    fclose(f);
+
+    char response[65536];
+    if (extra_message && strlen(extra_message) > 0) {
+        char *bodyPos = strstr(buffer, "<body");
+        if (bodyPos) {
+            char *endTag = strchr(bodyPos, '>');
+            if (endTag) {
+                endTag++;
+                snprintf(response, sizeof(response),
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n"
+                    "%.*s<p style='color:crimson;font-weight:700;'>%s</p>%s",
+                    (int)(endTag - buffer), buffer, extra_message, endTag);
+                send(sock, response, (int)strlen(response), 0);
+                return;
+            }
+        }
+        snprintf(response, sizeof(response),
+                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n%s"
+                 "<p style='color:crimson;'>%s</p>", buffer, extra_message);
+        send(sock, response, (int)strlen(response), 0);
+    } else {
+        snprintf(response, sizeof(response),
+                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n%s",
+                 buffer);
+        send(sock, response, (int)strlen(response), 0);
+    }
+}
+
+void send_404_response(SOCKET sock) {
+    const char *nf = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<h1>404 - Page non trouvée</h1>";
+    send(sock, nf, (int)strlen(nf), 0);
+}
+
+// =========================================================
+// DATABASE
+// =========================================================
+void initDB(sqlite3 *db) {
+    char *err = NULL;
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS etat_appareils ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "appareil TEXT UNIQUE, "
+        "etat TEXT, "
+        "compteur_on INTEGER DEFAULT 0, "
+        "compteur_off INTEGER DEFAULT 0, "
+        "dernier_changement DATETIME DEFAULT CURRENT_TIMESTAMP);";
+    if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
+        fprintf(stderr, "Erreur creation table: %s\n", err);
+        sqlite3_free(err);
+    }
+
+    printf("[DB] Table prête, aucune ligne insérée.\n");
+}
+
+
+void resetDB(sqlite3 *db) {
+    const char *del = "DELETE FROM etat_appareils;";
+    sqlite3_exec(db, del, NULL, NULL, NULL);
+    initDB(db);
+    printf("[DB] Base '%s' réinitialisée.\n", DB_FILE);
+}
+
+void getEtat(sqlite3 *db, const char *nom, char *etat_out, size_t outlen) {
+    const char *sql = "SELECT etat FROM etat_appareils WHERE appareil = ?;";
+    sqlite3_stmt *stmt = NULL;
+    strncpy(etat_out, "OFF", outlen);
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, nom, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char *t = sqlite3_column_text(stmt, 0);
+            if (t) strncpy(etat_out, (const char*)t, outlen);
+        }
+    }
+    if (stmt) sqlite3_finalize(stmt);
+}
+
+void majEtat(sqlite3 *db, const char *nom, const char *etat) {
+    char actuel[32];
+    getEtat(db, nom, actuel, sizeof(actuel));
+
+    // Si l'appareil n'existe pas, on l'ajoute
+    if (strcmp(actuel, "OFF") == 0 && strcmp(etat, "OFF") != 0) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+            "INSERT OR IGNORE INTO etat_appareils (appareil, etat) VALUES ('%s', '%s');",
+            nom, etat);
+        sqlite3_exec(db, sql, 0, 0, 0);
+    }
+
+    int inc_on = (strcmp(actuel, "ON") != 0 && strcmp(etat, "ON") == 0);
+    int inc_off = (strcmp(actuel, "OFF") != 0 && strcmp(etat, "OFF") == 0);
+
+
+const char *sql = "UPDATE etat_appareils SET etat=?, dernier_changement=CURRENT_TIMESTAMP WHERE appareil=?;";
+
+if (strcmp(etat, "ON") == 0)
+    sql = "UPDATE etat_appareils SET etat=?, dernier_changement=CURRENT_TIMESTAMP, compteur_on = compteur_on + 1 WHERE appareil=?;";
+else if (strcmp(etat, "OFF") == 0)
+    sql = "UPDATE etat_appareils SET etat=?, dernier_changement=CURRENT_TIMESTAMP, compteur_off = compteur_off + 1 WHERE appareil=?;";
+
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, etat, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, nom, -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+    }
+    if (stmt) sqlite3_finalize(stmt);
+}
+
+
+// =========================================================
+// QUERY PARSING (corrigée)
+// =========================================================
+void extract_query(const char *path, char *device_out, char *etat_out, char *type_out) {
+    device_out[0] = etat_out[0] = type_out[0] = '\0';
+    const char *q = strchr(path, '?');
+    if (!q) return;
+    q++;
+
+    char tmp[512];
+    strncpy(tmp, q, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    char *token = strtok(tmp, "&");
+    while (token) {
+        if (strncmp(token, "nom=", 4) == 0)
+            url_decode(device_out, token + 4);
+        else if (strncmp(token, "etat=", 5) == 0)
+            url_decode(etat_out, token + 5);
+        else if (strncmp(token, "type=", 5) == 0)
+            url_decode(type_out, token + 5);
+        token = strtok(NULL, "&");
+    }
+
+    printf("DEBUG: nom='%s', etat='%s', type='%s'\n", device_out, etat_out, type_out);
+}
+
+
+
+// =========================================================
+// MAIN
+// =========================================================
+int main(void) {
+    WSADATA wsa;
+    SOCKET server_sock, client_sock;
+    struct sockaddr_in server_addr;
+    int addrlen = sizeof(server_addr);
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open(DB_FILE, &db) != SQLITE_OK) {
+        fprintf(stderr, "Erreur ouverture DB: %s\n", sqlite3_errmsg(db));
+        if (db) sqlite3_close(db);
+        return 1;
+    }
+    sqlite3_busy_timeout(db, 5000);
+    initDB(db);
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        sqlite3_close(db);
+        return 1;
+    }
+
+    server_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server_sock == INVALID_SOCKET) {
+        fprintf(stderr, "socket failed\n");
+        WSACleanup();
+        sqlite3_close(db);
+        return 1;
+    }
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(PORT);
+
+    if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+        fprintf(stderr, "bind failed\n");
+        closesocket(server_sock);
+        WSACleanup();
+        sqlite3_close(db);
+        return 1;
+    }
+
+    if (listen(server_sock, 10) == SOCKET_ERROR) {
+        fprintf(stderr, "listen failed\n");
+        closesocket(server_sock);
+        WSACleanup();
+        sqlite3_close(db);
+        return 1;
+    }
+
+    printf("🌐 Serveur prêt sur http://localhost:%d\n", PORT);
+
+    while (1) {
+        client_sock = accept(server_sock, (struct sockaddr*)&server_addr, &addrlen);
+        if (client_sock == INVALID_SOCKET) continue;
+
+        char recvbuf[RECV_BUF];
+        memset(recvbuf, 0, sizeof(recvbuf));
+        int r = recv(client_sock, recvbuf, sizeof(recvbuf) - 1, 0);
+        if (r <= 0) {
+            closesocket(client_sock);
+            continue;
+        }
+
+        char method[16] = {0}, path[1024] = {0};
+        sscanf(recvbuf, "%15s %1023s", method, path);
+        printf("Requête: %s %s\n", method, path);
+
+        // ROUTES HTTP (toutes présentes)
+        if (strcmp(method, "GET") == 0 && (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0))
+            send_file_response(client_sock, "index.html", NULL);
+        else if (strcmp(method, "GET") == 0 && (strcmp(path, "/login") == 0 || strcmp(path, "/login.html") == 0))
+            send_file_response(client_sock, "login.html", NULL);
+        else if (strcmp(method, "GET") == 0 && (strcmp(path, "/signup") == 0 || strcmp(path, "/signup.html") == 0))
+            send_file_response(client_sock, "signup.html", NULL);
+        else if (strcmp(method, "GET") == 0 && (strcmp(path, "/accueil") == 0 || strcmp(path, "/accueil.html") == 0))
+            send_file_response(client_sock, "accueil.html", NULL);
+        else if (strcmp(method, "GET") == 0 && (strcmp(path, "/logout") == 0 || strcmp(path, "/logout.html") == 0))
+            send_file_response(client_sock, "logout.html", NULL);
+
+        // ROUTE UPDATE (compatible JS)
+        else if (strcmp(method, "GET") == 0 && strncmp(path, "/update", 7) == 0) {
+            char nom[128] = {0}, type[128] = {0}, etat[128] = {0};
+            extract_query(path, nom, etat, type);
+            printf("[UPDATE] nom=%s | etat=%s | type=%s\n", nom, etat, type);
+            if (nom[0] != '\0' && etat[0] != '\0') {
+                majEtat(db, nom, etat);
+                const char *ok = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK";
+                send(client_sock, ok, (int)strlen(ok), 0);
+            } else {
+                const char *bad = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nMissing params";
+                send(client_sock, bad, (int)strlen(bad), 0);
+            }
+        }
+
+        // ROUTE STATE
+        else if (strcmp(method, "GET") == 0 && strcmp(path, "/state") == 0) {
+            char out[1024];
+            char e1[32], e2[32], e3[32];
+            getEtat(db, "lumiere", e1, sizeof(e1));
+            getEtat(db, "volets", e2, sizeof(e2));
+            getEtat(db, "clim", e3, sizeof(e3));
+            snprintf(out, sizeof(out), "lumiere=%s;volets=%s;clim=%s", e1, e2, e3);
+            char resp[2048];
+            snprintf(resp, sizeof(resp), "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s", out);
+            send(client_sock, resp, (int)strlen(resp), 0);
+        }
+
+        // ROUTE RESET DB
+        else if (strcmp(method, "GET") == 0 && strcmp(path, "/reset-db") == 0) {
+            resetDB(db);
+            const char *ok = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nBase réinitialisée";
+            send(client_sock, ok, (int)strlen(ok), 0);
+        }
+
+        else send_404_response(client_sock);
+
+        closesocket(client_sock);
+    }
+
+    closesocket(server_sock);
+    sqlite3_close(db);
+    WSACleanup();
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ACCUEIL
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Domo-Connect — Tableau de Bord</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Segoe UI',Tahoma,sans-serif;background:linear-gradient(145deg,#0c0c12,#1b1b26);color:#e0e0e0;min-height:100vh;padding:20px;}
+.hidden{display:none;}
+header{display:flex;justify-content:space-between;align-items:center;padding:25px 40px;background:rgba(139,0,255,0.1);border-radius:15px;margin-bottom:30px;backdrop-filter:blur(10px);border:1px solid rgba(139,0,255,0.2);}
+.deconnexion{background:linear-gradient(135deg,#8b00ff,#6200ea);color:white;padding:12px 28px;border-radius:8px;cursor:pointer;}
+.accueil-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:25px;max-width:1400px;margin:0 auto;}
+.module{background:rgba(30,30,46,0.8);border-radius:15px;padding:25px;border:1px solid rgba(139,0,255,0.2);box-shadow:0 8px 32px rgba(0,0,0,0.3);}
+.module h2{color:#bb86fc;margin-bottom:20px;font-size:1.5rem;border-bottom:2px solid rgba(139,0,255,0.3);padding-bottom:10px;}
+.status-btn{border:2px solid;padding:8px 20px;border-radius:20px;font-weight:600;font-size:0.9rem;min-width:80px;background:transparent;cursor:pointer;transition:all 0.2s ease;}
+.status-btn.off{color:#ff6b6b;border-color:#ff6b6b;background:rgba(255,107,107,0.1);}
+.status-btn.on{color:#4ecdc4;border-color:#4ecdc4;background:rgba(78,205,196,0.1);}
+.status-btn.on{color:#bb86fc;border-color:#bb86fc;background:rgba(187,134,252,0.1);}
+.status-btn.off{color:#ff6b6b;border-color:#ff6b6b;background:rgba(255,107,107,0.1);}
+.module table{width:100%;border-collapse:collapse;}
+.module td{padding:12px;font-size:0.95rem;}
+.module td:first-child{color:#c0c0c0;}
+.module td:last-child{text-align:right;}
+.reset-btn{display:block;margin:40px auto;padding:12px 30px;background:linear-gradient(135deg,#ff7e5f,#feb47b);border:none;border-radius:10px;font-size:1rem;color:#1b1b26;font-weight:600;cursor:pointer;}
+.deconnexion-container{display:flex;justify-content:center;align-items:center;min-height:100vh;}
+.deconnexion-card{background:rgba(30,30,46,0.9);border-radius:20px;padding:60px;text-align:center;border:2px solid rgba(139,0,255,0.3);box-shadow:0 20px 60px rgba(139,0,255,0.3);}
+.deconnexion-card h1{font-size:3rem;color:#bb86fc;margin-bottom:10px;}
+.btn-retour{display:inline-block;background:linear-gradient(135deg,#8b00ff,#6200ea);color:#fff;text-decoration:none;padding:15px 35px;border-radius:10px;font-size:1.1rem;}
+
+</style>
+</head>
+<body>
+
+<!-- PAGE ACCUEIL -->
+<div id="page-accueil">
+  <header>
+    <h1>Bonjour <span id="user-name">Admin</span></h1>
+    <button class="deconnexion" onclick="showLogout()">Se Déconnecter</button>
+  </header>
+
+  <!-- 🏠 RDC -->
+<div class="module">
+  <h2>🏠 Rez-de-chaussée</h2>
+  <table>
+    <tr><td>Salon - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'salon_rdc')">OFF</button></td></tr>
+    <tr><td>Cuisine - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'cuisine_rdc')">OFF</button></td></tr>
+    <tr><td>Cuisine - Clim</td><td><button class="status-btn off" onclick="toggleDevice(this, 'clim', 'cuisine_rdc')">OFF</button></td></tr>
+    <tr><td>Salon - Volets</td><td><button class="status-btn off" onclick="toggleDevice(this, 'volet', 'salon_rdc')">OFF</button></td></tr>
+    <tr><td>Entrée - Caméra</td><td><button class="status-btn off" onclick="toggleDevice(this, 'securite', 'camera_entree')">OFF</button></td></tr>
+    <tr><td>Toilettes</td><td><button class="status-btn off" onclick="toggleDevice(this, 'sanitaire', 'toilettes_rdc')">OFF</button></td></tr>
+  </table>
+</div>
+
+<!-- 🛏️ 1er Étage -->
+<div class="module">
+  <h2>🛏️ 1er Étage</h2>
+  <table>
+    <tr><td>Chambre parents - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'chambre_parents')">OFF</button></td></tr>
+    <tr><td>Chambre parents - Clim</td><td><button class="status-btn off" onclick="toggleDevice(this, 'clim', 'chambre_parents')">OFF</button></td></tr>
+    <tr><td>Chambre enfants - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'chambre_enfants')">OFF</button></td></tr>
+    <tr><td>Chambre enfants - Volets</td><td><button class="status-btn off" onclick="toggleDevice(this, 'volet', 'chambre_enfants')">OFF</button></td></tr>
+    <tr><td>Salle de bain - Chauffage</td><td><button class="status-btn off" onclick="toggleDevice(this, 'chauffage', 'sdb_1etage')">OFF</button></td></tr>
+    <tr><td>Salle de bain - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'sdb_1etage')">OFF</button></td></tr>
+  </table>
+</div>
+
+<!-- 💼 2e Étage -->
+<div class="module">
+  <h2>💼 2e Étage (Bureau & Loisirs)</h2>
+  <table>
+    <tr><td>Bureau - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'bureau_2etage')">OFF</button></td></tr>
+    <tr><td>Bureau - Clim</td><td><button class="status-btn off" onclick="toggleDevice(this, 'clim', 'bureau_2etage')">OFF</button></td></tr>
+    <tr><td>Salle cinéma - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'cinema')">OFF</button></td></tr>
+    <tr><td>Salle cinéma - Volets</td><td><button class="status-btn off" onclick="toggleDevice(this, 'volet', 'cinema')">OFF</button></td></tr>
+    <tr><td>Salle sport - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'sport')">OFF</button></td></tr>
+    <tr><td>Salle sport - Clim</td><td><button class="status-btn off" onclick="toggleDevice(this, 'clim', 'sport')">OFF</button></td></tr>
+  </table>
+</div>
+
+<!-- 🌆 3e Étage -->
+<div class="module">
+  <h2>🌆 3e Étage (Grenier / Extérieurs)</h2>
+  <table>
+    <tr><td>Grenier - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'grenier')">OFF</button></td></tr>
+    <tr><td>Terrasse - Lumière</td><td><button class="status-btn off" onclick="toggleDevice(this, 'ampoule', 'terrasse')">OFF</button></td></tr>
+    <tr><td>Terrasse - Volets</td><td><button class="status-btn off" onclick="toggleDevice(this, 'volet', 'terrasse')">OFF</button></td></tr>
+  </table>
+</div>
+
+
+  <button class="reset-btn" onclick="resetDB()">🔄 Réinitialiser la base</button>
+</div>
+
+<!-- PAGE DECONNEXION -->
+<div id="page-logout" class="hidden">
+  <div class="deconnexion-container">
+    <div class="deconnexion-card">
+      <h1>À bientôt 👋</h1>
+      <p>Vous avez été déconnecté avec succès</p>
+      <a href="index.html" class="btn-retour" onclick="showAccueil()">Retour au menu principal</a>
+    </div>
+  </div>
+</div>
+
+<script>
+const dashPage = document.getElementById('page-accueil');
+const logoutPage = document.getElementById('page-logout');
+
+function showLogout(){
+  dashPage.classList.add('hidden');
+  logoutPage.classList.remove('hidden');
+}
+
+function showAccueil(){
+  logoutPage.classList.add('hidden');
+  dashPage.classList.remove('hidden');
+}
+
+// 🔁 Réinitialisation de la base
+function resetDB(){
+  fetch('/reset-db')
+    .then(r => r.text())
+    .then(txt => alert(txt))
+    .catch(e => alert('Erreur : ' + e));
+}
+
+// 💡 Fonction pour ampoules, clim et volets
+function toggleDevice(btn, type, name){
+  let newState;
+  if(btn.classList.contains('off')){
+    btn.classList.replace('off','on');
+    btn.textContent='ON';
+    newState='ON';
+  } else {
+    btn.classList.replace('on','off');
+    btn.textContent='OFF';
+    newState='OFF';
+  }
+
+  fetch(`/update?type=${type}&nom=${name}&etat=${newState}`)
+    .then(r => r.text())
+    .then(console.log)
+    .catch(e => console.error('Erreur update:', e));
+}
+</script>
+
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+index
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Domo-Connect | Portail de Contrôle Domotique - Smart Luxury</title>
+    <meta name="description" content="Domo-Connect : Votre portail sécurisé pour le contrôle total de votre résidence intelligente. Confort, sécurité et élégance centralisés.">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;300;400;500;700&display=swap" rel="stylesheet">
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
+
+        :root {
+            --bg-start: #0c0c12;
+            --bg-end: #1b1b26;
+            --primary-color: #9c27b0;
+            --text-light: #f5f5f5;
+            --text-muted: #b0b0b0;
+            --glass-bg: rgba(30, 30, 45, 0.65);
+            --shadow-lg: 0 10px 60px rgba(0, 0, 0, 0.8);
+            --shadow-btn: 0 4px 15px rgba(0, 0, 0, 0.2);
+            --radius: 16px;
+            --transition: 0.3s ease;
+        }
+
+        body {
+            height: 100vh;
+            margin: 0;
+            background: radial-gradient(circle at 20% 20%, var(--bg-start), var(--bg-end));
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+            color: var(--text-light);
+        }
+
+        .container {
+            background-color: var(--glass-bg);
+            border-radius: var(--radius);
+            padding: 60px 40px;
+            width: 95%;
+            max-width: 480px;
+            text-align: center;
+            box-shadow: var(--shadow-lg);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(12px);
+            transform: scale(0.98);
+            opacity: 0;
+            transition: all 0.8s var(--transition);
+        }
+        .container.loaded {
+            opacity: 1;
+            transform: scale(1);
+        }
+
+        h1 {
+            font-size: 2.8rem;
+            letter-spacing: 2px;
+            font-weight: 300;
+            margin-bottom: 10px;
+        }
+
+        h2 {
+            color: var(--primary-color);
+            font-weight: 400;
+            font-size: 1.1rem;
+            letter-spacing: 1px;
+            margin-bottom: 25px;
+        }
+
+        p {
+            color: var(--text-muted);
+            font-weight: 300;
+            line-height: 1.6;
+            margin-bottom: 40px;
+        }
+
+        .btn-container {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .btn {
+            padding: 14px;
+            border: none;
+            border-radius: 8px;
+            text-transform: uppercase;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all var(--transition);
+            text-decoration: none;
+            letter-spacing: 1px;
+        }
+
+        .btn-login {
+            background-color: var(--primary-color);
+            color: white;
+        }
+
+        .btn-login:hover {
+            background-color: #a739c0;
+            transform: translateY(-2px);
+        }
+
+        .btn-signup {
+            border: 2px solid var(--primary-color);
+            color: var(--primary-color);
+            background: transparent;
+        }
+
+        .btn-signup:hover {
+            background-color: var(--primary-color);
+            color: var(--bg-start);
+            transform: translateY(-2px);
+        }
+
+        footer {
+            position: fixed;
+            bottom: 15px;
+            left: 0;
+            width: 100%;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+
+        footer a {
+            color: var(--primary-color);
+            text-decoration: none;
+            margin: 0 5px;
+            transition: 0.3s;
+        }
+
+        footer a:hover {
+            color: #d067ee;
+        }
+
+        @media (max-height: 700px) {
+            .container { padding: 40px 25px; }
+            h1 { font-size: 2.2rem; }
+            p { font-size: 0.95rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container" id="main-content">
+        <h1>Domo-Connect</h1>
+        <h2>Smart Luxury & Secure Living</h2>
+        <p>Votre portail vers un <strong>confort</strong> et une <strong>sécurité</strong> inégalés. Domo-Connect vous offre le contrôle total de votre résidence intelligente.</p>
+        <div class="btn-container">
+            <a href="/login.html" class="btn btn-login">Se connecter</a>
+            <a href="/signup.html" class="btn btn-signup">Créer un compte</a>
+        </div>
+    </div>
+
+    <footer>
+        <p>© 2025 Domo-Connect | <a href="#">Mentions légales</a> | <a href="#">Confidentialité</a></p>
+    </footer>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            const container = document.getElementById("main-content");
+            setTimeout(() => container.classList.add("loaded"), 100);
+        });
+    </script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+login
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Domo-Connect — Connexion</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;300;400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg-start:#0c0c12;
+    --bg-end:#1b1b26;
+    --primary-color:#9c27b0;
+    --accent-color:#dc75ef;
+    --text-light:#f5f5f5;
+    --text-muted:#b0b0b0;
+    --glass-bg: rgba(30,30,45,0.65);
+    --shadow-lg:0 10px 60px rgba(0,0,0,0.8);
+    --shadow-btn:0 4px 15px rgba(0,0,0,0.2);
+    --radius:14px;
+    font-family:'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+*{box-sizing:border-box;margin:0;padding:0;}
+html, body{height:100%;background:linear-gradient(145deg,var(--bg-start),var(--bg-end));overflow:hidden;color:var(--text-light);display:flex;align-items:center;justify-content:center;}
+
+body::before, body::after{
+    content:'';
+    position:absolute;
+    width:350px;height:350px;
+    border-radius:50%;
+    filter:blur(120px);
+    opacity:0.35;
+    z-index:0;
+    animation: floatOrb 16s ease-in-out infinite alternate;
+}
+body::before{background:var(--primary-color);top:-80px;left:-100px;}
+body::after{background:var(--accent-color);bottom:-100px;right:-120px;animation-delay:4s;}
+@keyframes floatOrb{0%{transform:translateY(0) scale(1);}100%{transform:translateY(20px) scale(1.05);}}
+
+.wrap{height:100%;display:flex;align-items:center;justify-content:center;padding:24px;position:relative;z-index:1;}
+.card{
+    position:relative; width:100%; max-width:420px; background:var(--glass-bg); padding:26px;
+    border-radius:var(--radius); box-shadow:var(--shadow-lg); border:1px solid rgba(255,255,255,0.05);
+    backdrop-filter:blur(10px); overflow:hidden; transition: transform 0.25s, box-shadow 0.25s;
+}
+.card:hover{transform:translateY(-4px); box-shadow:0 0 45px var(--primary-color);}
+.card::before{
+    content:''; position:absolute; top:0; left:0; width:100%; height:100%;
+    background: linear-gradient(135deg, rgba(255,255,255,0.12) 0%, rgba(255,255,255,0) 60%);
+    pointer-events:none; border-radius:var(--radius);
+}
+
+.brand{display:flex;gap:12px;align-items:center;margin-bottom:14px;}
+.logo{width:56px;height:56px;border-radius:12px;background:linear-gradient(135deg,var(--primary-color),var(--accent-color));
+display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:20px;box-shadow:0 0 10px var(--primary-color);animation:pulse 3s ease-in-out infinite;}
+@keyframes pulse{0%,100%{box-shadow:0 0 10px var(--primary-color);transform:scale(1);}50%{box-shadow:0 0 25px var(--accent-color);transform:scale(1.05);}}
+
+h1{font-size:22px;margin-bottom:6px;}
+p.lead{font-size:14px;color:var(--text-muted);margin-bottom:20px;}
+
+form .field{margin-bottom:14px;}
+label{display:block;font-size:13px;color:var(--text-muted);margin-bottom:6px;}
+input[type="text"], input[type="password"]{
+    width:100%; padding:11px 13px; border-radius:10px; border:1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.05); color: var(--text-light); font-size:15px; transition: border-color 0.2s, box-shadow 0.2s;
+}
+input:focus{outline:none;border-color:var(--accent-color);box-shadow:0 0 8px var(--primary-color);}
+
+.checkbox{display:flex;align-items:center;gap:8px;color:var(--text-muted);font-size:14px;}
+a.muted{color:var(--text-muted);font-size:13px;transition:0.2s;}
+a.muted:hover{color:var(--accent-color);}
+
+button.primary{
+    display:inline-flex;align-items:center;justify-content:center;width:100%;padding:11px;border:none;border-radius:10px;
+    background:linear-gradient(90deg,var(--primary-color),var(--accent-color));color:#fff;font-weight:600;font-size:15px;cursor:pointer;
+    transition: transform 0.15s, box-shadow 0.15s;
+}
+button.primary:hover{transform:scale(1.03);box-shadow:0 0 20px rgba(176,133,255,0.4);}
+button.primary:disabled{opacity:0.6;cursor:wait;}
+
+.help{height:18px;margin-top:8px;color:#ff7b7b;font-size:13px;}
+.spinner{width:18px;height:18px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+.alt{display:flex;justify-content:space-between;align-items:center;margin-top:12px;}
+.footer{text-align:center;font-size:12px;margin-top:16px;color:var(--text-muted);}
+
+@media(max-width:480px){.card{padding:18px;margin:6px;}.logo{width:48px;height:48px;font-size:17px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <div class="card">
+      <div class="brand">
+        <div class="logo">DC</div>
+        <div>
+          <h1>Domo-Connect</h1>
+          <p class="lead">Connecte-toi pour piloter ta maison intelligente</p>
+        </div>
+      </div>
+
+      <form id="loginForm" novalidate>
+        <div class="field">
+          <label for="username">Nom d'utilisateur</label>
+          <input id="username" name="username" type="text" placeholder="ex. alice" required autofocus />
+        </div>
+
+        <div class="field">
+          <label for="password">Mot de passe</label>
+          <input id="password" name="password" type="password" placeholder="••••••••" required />
+        </div>
+
+        <div class="row" style="display:flex;justify-content:space-between;align-items:center;">
+          <label class="checkbox"><input id="remember" type="checkbox"> Se souvenir de moi</label>
+          <a href="#" id="forgot" class="muted">Mot de passe oublié ?</a>
+        </div>
+
+        <div style="height:10px"></div>
+
+        <button type="submit" class="primary" id="btnLogin"><span id="btnContent">Se connecter</span></button>
+        <div id="help" class="help"></div>
+
+        <div class="alt">
+          <span class="muted">Créer un compte ?</span>
+          <a href="#" id="signup" class="muted">Demander un accès</a>
+        </div>
+      </form>
+
+      <div class="footer">© 2025 Domo-Connect — Gestion domotique sécurisée</div>
+    </div>
+</div>
+
+<script>
+const form = document.getElementById('loginForm');
+const btn = document.getElementById('btnLogin');
+const btnContent = document.getElementById('btnContent');
+const help = document.getElementById('help');
+
+function setLoading(loading){
+  if(loading){
+    btn.disabled = true;
+    btnContent.innerHTML = '<span class="spinner"></span>&nbsp;Connexion…';
+  } else {
+    btn.disabled = false;
+    btnContent.textContent = 'Se connecter';
+  }
+}
+function showError(msg){ help.textContent = msg; }
+function clearError(){ help.textContent = ''; }
+
+function simulateLogin(username,password){
+  return new Promise((resolve)=>{
+    setTimeout(()=>{
+      if(username==='admin' && password==='admin'){
+        resolve({success:true,user:{id:1,username,role:'admin'}});
+      } else {
+        resolve({success:false,message:'Identifiants incorrects'});
+      }
+    },900);
+  });
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearError();
+  const username = form.username.value.trim();
+  const password = form.password.value;
+  if (!username) { showError("Entrez votre nom d’utilisateur"); return; }
+  if (!password) { showError("Entrez votre mot de passe"); return; }
+  setLoading(true);
+  try {
+    const res = await simulateLogin(username, password);
+    if (res.success) {
+      const remember = document.getElementById('remember').checked;
+      const storage = remember ? localStorage : sessionStorage;
+      storage.setItem('mc_user', JSON.stringify(res.user));
+      btnContent.textContent = 'Succès ✓';
+      setTimeout(()=>{ window.location.href='accueil.html'; },500);
+    } else { showError(res.message); }
+  } catch(err){ showError("Erreur réseau"); }
+  finally{ setLoading(false); }
+});
+
+document.getElementById('forgot').addEventListener('click', (e)=>{ e.preventDefault(); alert("Procédure mot de passe oublié à implémenter côté backend."); });
+document.getElementById('signup').addEventListener('click', (e)=>{ e.preventDefault(); alert("Contactez l’administrateur pour créer un compte."); });
+
+(function prefillUser(){
+  try {
+    const u = JSON.parse(localStorage.getItem('mc_user')||sessionStorage.getItem('mc_user')||'null');
+    if(u && u.username){ form.username.value = u.username; document.getElementById('remember').checked=!!localStorage.getItem('mc_user'); }
+  } catch(e){ console.error(e); }
+})();
+</script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+(PAGE D'ACCEUIL) 
+
+
+1/ index 1 er page 
+
+
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tableau de Bord Maison</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Bonjour User</h1>
+      <button class="deconnexion" onclick="deconnexion()">
+        Se Déconnecter
+      </button>
+    </header>
+
+    <div class="dashboard-container">
+      <div class="module">
+        <h2>💡 Ampoules</h2>
+        <table>
+          <tr>
+            <td>Garages nord - Projecteur extérieur</td>
+            <td>
+              <button class="status-btn off" onclick="toggleLight(this)">
+                OFF
+              </button>
+            </td>
+          </tr>
+          <tr>
+            <td>Garages nord - Hublot extérieur est</td>
+            <td>
+              <button class="status-btn off" onclick="toggleLight(this)">
+                OFF
+              </button>
+            </td>
+          </tr>
+          <tr>
+            <td>Garages ouest - Projecteur extérieur</td>
+            <td>
+              <button class="status-btn off" onclick="toggleLight(this)">
+                OFF
+              </button>
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <div class="module">
+        <h2>🪟 Volets</h2>
+        <table>
+          <tr>
+            <td>Balcon</td>
+            <td>
+              <button class="status-btn open" onclick="toggleShutter(this)">
+                OPEN
+              </button>
+            </td>
+          </tr>
+          <tr>
+            <td>Bureau</td>
+            <td>
+              <button class="status-btn open" onclick="toggleShutter(this)">
+                OPEN
+              </button>
+            </td>
+          </tr>
+          <tr>
+            <td>Chambre invités</td>
+            <td>
+              <button class="status-btn open" onclick="toggleShutter(this)">
+                OPEN
+              </button>
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <div class="module">
+        <h2>❄️ Climatisations</h2>
+        <table>
+          <tr>
+            <td>Bibliothèque</td>
+            <td>
+              <button class="status-btn on" onclick="toggleAC(this)">ON</button>
+            </td>
+          </tr>
+          <tr>
+            <td>Bureau</td>
+            <td>
+              <button class="status-btn on" onclick="toggleAC(this)">ON</button>
+            </td>
+          </tr>
+          <tr>
+            <td>Chambre invités</td>
+            <td>
+              <button class="status-btn on" onclick="toggleAC(this)">ON</button>
+            </td>
+          </tr>
+        </table>
+      </div>
+    </div>
+
+    <script src="script.js"></script>
+  </body>
+</html>
+
+
+
+
+
+
+
+2/ page de deconnexion 
+
+
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Déconnexion</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="deconnexion-container">
+      <div class="deconnexion-card">
+        <div class="icon">👋</div>
+        <h1>À bientôt !</h1>
+        <p class="message">
+          Merci d'avoir utilisé votre tableau de bord domotique
+        </p>
+        <p class="submessage">Vous avez été déconnecté avec succès</p>
+        <a href="index.html" class="btn-retour">Retour à la connexion</a>
+      </div>
+    </div>
+  </body>
+</html>
+
+
+
+
+3/ script js 
+
+function toggleLight(button) {
+  if (button.classList.contains('off')) {
+    button.classList.remove('off');
+    button.classList.add('on');
+    button.textContent = 'ON';
+  } else {
+    button.classList.remove('on');
+    button.classList.add('off');
+    button.textContent = 'OFF';
+  }
+}
+
+function toggleShutter(button) {
+  if (button.classList.contains('open')) {
+    button.classList.remove('open');
+    button.classList.add('close');
+    button.textContent = 'CLOSE';
+  } else {
+    button.classList.remove('close');
+    button.classList.add('open');
+    button.textContent = 'OPEN';
+  }
+}
+
+function toggleAC(button) {
+  if (button.classList.contains('on')) {
+    button.classList.remove('on');
+    button.classList.add('off');
+    button.textContent = 'OFF';
+  } else {
+    button.classList.remove('off');
+    button.classList.add('on');
+    button.textContent = 'ON';
+  }
+}
+
+function deconnexion() {
+  window.location.href = 'deconnexion.html';
+}
+
+
+
+
+4/ style css 
+
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  color: #e0e0e0;
+  min-height: 100vh;
+  padding: 20px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 25px 40px;
+  background: rgba(139, 0, 255, 0.1);
+  border-radius: 15px;
+  margin-bottom: 30px;
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(139, 0, 255, 0.2);
+}
+
+h1 {
+  color: #bb86fc;
+  font-size: 2rem;
+  font-weight: 600;
+}
+
+.deconnexion {
+  background: linear-gradient(135deg, #8b00ff 0%, #6200ea 100%);
+  color: white;
+  border: none;
+  padding: 12px 28px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 1rem;
+  font-weight: 500;
+  transition: all 0.3s ease;
+  box-shadow: 0 4px 15px rgba(139, 0, 255, 0.3);
+}
+
+.deconnexion:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(139, 0, 255, 0.5);
+}
+
+.dashboard-container {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+  gap: 25px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.module {
+  background: rgba(30, 30, 46, 0.8);
+  border-radius: 15px;
+  padding: 25px;
+  border: 1px solid rgba(139, 0, 255, 0.2);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(10px);
+  transition: all 0.3s ease;
+}
+
+.module:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 12px 40px rgba(139, 0, 255, 0.2);
+  border-color: rgba(139, 0, 255, 0.4);
+}
+
+.module h2 {
+  color: #bb86fc;
+  margin-bottom: 20px;
+  font-size: 1.5rem;
+  font-weight: 600;
+  padding-bottom: 15px;
+  border-bottom: 2px solid rgba(139, 0, 255, 0.3);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+tr {
+  border-bottom: 1px solid rgba(139, 0, 255, 0.1);
+}
+
+tr:last-child {
+  border-bottom: none;
+}
+
+td {
+  padding: 15px 10px;
+  font-size: 0.95rem;
+}
+
+td:first-child {
+  color: #c0c0c0;
+}
+
+td:last-child {
+  text-align: right;
+}
+
+.status-btn {
+  background: transparent;
+  border: 2px solid;
+  padding: 8px 20px;
+  border-radius: 20px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  transition: all 0.3s ease;
+  min-width: 80px;
+}
+
+.status-btn.off {
+  color: #ff6b6b;
+  border-color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.1);
+}
+
+.status-btn.off:hover {
+  background: rgba(255, 107, 107, 0.2);
+  transform: scale(1.05);
+}
+
+.status-btn.on {
+  color: #4ecdc4;
+  border-color: #4ecdc4;
+  background: rgba(78, 205, 196, 0.1);
+}
+
+.status-btn.on:hover {
+  background: rgba(78, 205, 196, 0.2);
+  transform: scale(1.05);
+}
+
+.status-btn.open {
+  color: #bb86fc;
+  border-color: #bb86fc;
+  background: rgba(187, 134, 252, 0.1);
+}
+
+.status-btn.open:hover {
+  background: rgba(187, 134, 252, 0.2);
+  transform: scale(1.05);
+}
+
+.status-btn.close {
+  color: #ff6b6b;
+  border-color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.1);
+}
+
+.status-btn.close:hover {
+  background: rgba(255, 107, 107, 0.2);
+  transform: scale(1.05);
+}
+
+@media (max-width: 768px) {
+  .dashboard-container {
+    grid-template-columns: 1fr;
+  }
+
+  header {
+    flex-direction: column;
+    gap: 15px;
+    text-align: center;
+  }
+
+  h1 {
+    font-size: 1.5rem;
+  }
+}
+
+/* Page de déconnexion */
+.deconnexion-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  padding: 20px;
+}
+
+.deconnexion-card {
+  background: rgba(30, 30, 46, 0.9);
+  border-radius: 20px;
+  padding: 60px 50px;
+  text-align: center;
+  border: 2px solid rgba(139, 0, 255, 0.3);
+  box-shadow: 0 20px 60px rgba(139, 0, 255, 0.3);
+  max-width: 600px;
+  animation: fadeIn 0.5s ease-in;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.deconnexion-card .icon {
+  font-size: 5rem;
+  margin-bottom: 20px;
+  animation: wave 1s ease-in-out infinite;
+}
+
+@keyframes wave {
+  0%, 100% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(20deg);
+  }
+  75% {
+    transform: rotate(-20deg);
+  }
+}
+
+.deconnexion-card h1 {
+  font-size: 3rem;
+  color: #bb86fc;
+  margin-bottom: 20px;
+}
+
+.deconnexion-card .message {
+  font-size: 1.5rem;
+  color: #e0e0e0;
+  margin-bottom: 15px;
+}
+
+.deconnexion-card .submessage {
+  font-size: 1.2rem;
+  color: #c0c0c0;
+  margin-bottom: 40px;
+}
+
+.btn-retour {
+  display: inline-block;
+  background: linear-gradient(135deg, #8b00ff 0%, #6200ea 100%);
+  color: white;
+  text-decoration: none;
+  padding: 15px 35px;
+  border-radius: 10px;
+  font-size: 1.1rem;
+  font-weight: 600;
+  transition: all 0.3s ease;
+  box-shadow: 0 4px 15px rgba(139, 0, 255, 0.3);
+}
+
+.btn-retour:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 8px 25px rgba(139, 0, 255, 0.5);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+___page de connexion 
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Domo-Connect — Connexion</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;300;400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg-start:#0c0c12;
+    --bg-end:#1b1b26;
+    --primary-color:#9c27b0;
+    --accent-color:#dc75ef;
+    --text-light:#f5f5f5;
+    --text-muted:#b0b0b0;
+    --glass-bg: rgba(30,30,45,0.65);
+    --shadow-lg:0 10px 60px rgba(0,0,0,0.8);
+    --shadow-btn:0 4px 15px rgba(0,0,0,0.2);
+    --radius:14px;
+    font-family:'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+*{box-sizing:border-box;margin:0;padding:0;}
+html, body{height:100%;background:linear-gradient(145deg,var(--bg-start),var(--bg-end));overflow:hidden;color:var(--text-light);display:flex;align-items:center;justify-content:center;}
+
+body::before, body::after{
+    content:'';
+    position:absolute;
+    width:350px;height:350px;
+    border-radius:50%;
+    filter:blur(120px);
+    opacity:0.35;
+    z-index:0;
+    animation: floatOrb 16s ease-in-out infinite alternate;
+}
+body::before{background:var(--primary-color);top:-80px;left:-100px;}
+body::after{background:var(--accent-color);bottom:-100px;right:-120px;animation-delay:4s;}
+@keyframes floatOrb{0%{transform:translateY(0) scale(1);}100%{transform:translateY(20px) scale(1.05);}}
+
+.wrap{height:100%;display:flex;align-items:center;justify-content:center;padding:24px;position:relative;z-index:1;}
+.card{
+    position:relative; width:100%; max-width:420px; background:var(--glass-bg); padding:26px;
+    border-radius:var(--radius); box-shadow:var(--shadow-lg); border:1px solid rgba(255,255,255,0.05);
+    backdrop-filter:blur(10px); overflow:hidden; transition: transform 0.25s, box-shadow 0.25s;
+}
+.card:hover{transform:translateY(-4px); box-shadow:0 0 45px var(--primary-color);}
+.card::before{
+    content:''; position:absolute; top:0; left:0; width:100%; height:100%;
+    background: linear-gradient(135deg, rgba(255,255,255,0.12) 0%, rgba(255,255,255,0) 60%);
+    pointer-events:none; border-radius:var(--radius);
+}
+
+.brand{display:flex;gap:12px;align-items:center;margin-bottom:14px;}
+.logo{width:56px;height:56px;border-radius:12px;background:linear-gradient(135deg,var(--primary-color),var(--accent-color));
+display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:20px;box-shadow:0 0 10px var(--primary-color);animation:pulse 3s ease-in-out infinite;}
+@keyframes pulse{0%,100%{box-shadow:0 0 10px var(--primary-color);transform:scale(1);}50%{box-shadow:0 0 25px var(--accent-color);transform:scale(1.05);}}
+
+h1{font-size:22px;margin-bottom:6px;}
+p.lead{font-size:14px;color:var(--text-muted);margin-bottom:20px;}
+
+form .field{margin-bottom:14px;}
+label{display:block;font-size:13px;color:var(--text-muted);margin-bottom:6px;}
+input[type="text"], input[type="password"]{
+    width:100%; padding:11px 13px; border-radius:10px; border:1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.05); color: var(--text-light); font-size:15px; transition: border-color 0.2s, box-shadow 0.2s;
+}
+input:focus{outline:none;border-color:var(--accent-color);box-shadow:0 0 8px var(--primary-color);}
+
+.checkbox{display:flex;align-items:center;gap:8px;color:var(--text-muted);font-size:14px;}
+a.muted{color:var(--text-muted);font-size:13px;transition:0.2s;}
+a.muted:hover{color:var(--accent-color);}
+
+button.primary{
+    display:inline-flex;align-items:center;justify-content:center;width:100%;padding:11px;border:none;border-radius:10px;
+    background:linear-gradient(90deg,var(--primary-color),var(--accent-color));color:#fff;font-weight:600;font-size:15px;cursor:pointer;
+    transition: transform 0.15s, box-shadow 0.15s;
+}
+button.primary:hover{transform:scale(1.03);box-shadow:0 0 20px rgba(176,133,255,0.4);}
+button.primary:disabled{opacity:0.6;cursor:wait;}
+
+.help{height:18px;margin-top:8px;color:#ff7b7b;font-size:13px;}
+.spinner{width:18px;height:18px;border:3px solid rgba(255,255,255,0.3);border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+.alt{display:flex;justify-content:space-between;align-items:center;margin-top:12px;}
+.footer{text-align:center;font-size:12px;margin-top:16px;color:var(--text-muted);}
+
+@media(max-width:480px){.card{padding:18px;margin:6px;}.logo{width:48px;height:48px;font-size:17px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <div class="card">
+      <div class="brand">
+        <div class="logo">DC</div>
+        <div>
+          <h1>Domo-Connect</h1>
+          <p class="lead">Connecte-toi pour piloter ta maison intelligente</p>
+        </div>
+      </div>
+
+      <form id="loginForm" novalidate>
+        <div class="field">
+          <label for="username">Nom d'utilisateur</label>
+          <input id="username" name="username" type="text" placeholder="ex. alice" required autofocus />
+        </div>
+
+        <div class="field">
+          <label for="password">Mot de passe</label>
+          <input id="password" name="password" type="password" placeholder="••••••••" required />
+        </div>
+
+        <div class="row" style="display:flex;justify-content:space-between;align-items:center;">
+          <label class="checkbox"><input id="remember" type="checkbox"> Se souvenir de moi</label>
+          <a href="#" id="forgot" class="muted">Mot de passe oublié ?</a>
+        </div>
+
+        <div style="height:10px"></div>
+
+        <button type="submit" class="primary" id="btnLogin"><span id="btnContent">Se connecter</span></button>
+        <div id="help" class="help"></div>
+
+        <div class="alt">
+          <span class="muted">Créer un compte ?</span>
+          <a href="#" id="signup" class="muted">Demander un accès</a>
+        </div>
+      </form>
+
+      <div class="footer">© 2025 Domo-Connect — Gestion domotique sécurisée</div>
+    </div>
+</div>
+
+<script>
+const form = document.getElementById('loginForm');
+const btn = document.getElementById('btnLogin');
+const btnContent = document.getElementById('btnContent');
+const help = document.getElementById('help');
+
+function setLoading(loading){
+  if(loading){
+    btn.disabled = true;
+    btnContent.innerHTML = '<span class="spinner"></span>&nbsp;Connexion…';
+  } else {
+    btn.disabled = false;
+    btnContent.textContent = 'Se connecter';
+  }
+}
+function showError(msg){ help.textContent = msg; }
+function clearError(){ help.textContent = ''; }
+
+function simulateLogin(username,password){
+  return new Promise((resolve)=>{
+    setTimeout(()=>{
+      if(username==='admin' && password==='admin'){
+        resolve({success:true,user:{id:1,username,role:'admin'}});
+      } else {
+        resolve({success:false,message:'Identifiants incorrects'});
+      }
+    },900);
+  });
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearError();
+  const username = form.username.value.trim();
+  const password = form.password.value;
+  if (!username) { showError("Entrez votre nom d’utilisateur"); return; }
+  if (!password) { showError("Entrez votre mot de passe"); return; }
+  setLoading(true);
+  try {
+    const res = await simulateLogin(username, password);
+    if (res.success) {
+      const remember = document.getElementById('remember').checked;
+      const storage = remember ? localStorage : sessionStorage;
+      storage.setItem('mc_user', JSON.stringify(res.user));
+      btnContent.textContent = 'Succès ✓';
+      setTimeout(()=>{ window.location.href='dashboard.html'; },500);
+    } else { showError(res.message); }
+  } catch(err){ showError("Erreur réseau"); }
+  finally{ setLoading(false); }
+});
+
+document.getElementById('forgot').addEventListener('click', (e)=>{ e.preventDefault(); alert("Procédure mot de passe oublié à implémenter côté backend."); });
+document.getElementById('signup').addEventListener('click', (e)=>{ e.preventDefault(); alert("Contactez l’administrateur pour créer un compte."); });
+
+(function prefillUser(){
+  try {
+    const u = JSON.parse(localStorage.getItem('mc_user')||sessionStorage.getItem('mc_user')||'null');
+    if(u && u.username){ form.username.value = u.username; document.getElementById('remember').checked=!!localStorage.getItem('mc_user'); }
+  } catch(e){ console.error(e); }
+})();
+</script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+_____page d'acceuil 
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Domo-Connect | Portail de Contrôle Domotique - Smart Luxury</title>
+    <meta name="description" content="Domo-Connect : Votre portail sécurisé pour le contrôle total de votre résidence intelligente. Confort, sécurité et élégance centralisés.">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100;300;400;500;700&display=swap" rel="stylesheet">
+    <style>
+        /* Reset */
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+
+        :root {
+            --bg-start: #0c0c12;
+            --bg-end: #1b1b26;
+            --primary-color: #9c27b0;
+            --text-light: #f5f5f5;
+            --text-muted: #b0b0b0;
+            --glass-bg: rgba(30, 30, 45, 0.65);
+            --shadow-lg: 0 10px 60px rgba(0, 0, 0, 0.8);
+            --shadow-btn: 0 4px 15px rgba(0, 0, 0, 0.2);
+            --transition-speed: 0.3s;
+            --radius: 14px;
+        }
+
+        body {
+            background: linear-gradient(135deg, var(--bg-start), var(--bg-end));
+            color: var(--text-light);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow-x: hidden;
+        }
+
+        /* Orbs animés */
+        body::before, body::after {
+            content:'';
+            position:absolute;
+            width:350px; height:350px;
+            border-radius:50%;
+            filter: blur(120px);
+            z-index:0;
+            opacity:0.35;
+            animation: floatOrb 16s ease-in-out infinite alternate;
+        }
+        body::before { background: var(--primary-color); top:-80px; left:-100px; }
+        body::after { background: #dc75ef; bottom:-100px; right:-120px; animation-delay:4s; }
+        @keyframes floatOrb { 0%{transform:translateY(0px) scale(1);} 100%{transform:translateY(20px) scale(1.05);} }
+
+        .container {
+            background-color: var(--glass-bg);
+            padding: 80px 50px;
+            border-radius: var(--radius);
+            max-width: 600px;
+            width: 90%;
+            text-align: center;
+            box-shadow: var(--shadow-lg);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            opacity: 0;
+            transform: translateY(20px);
+            transition: opacity 1s ease, transform 1s ease;
+            position: relative;
+            z-index: 1;
+        }
+        .container.loaded { opacity:1; transform: translateY(0); }
+        .container::before {
+            content:'';
+            position:absolute; top:0; left:0; width:100%; height:100%;
+            background: linear-gradient(135deg, rgba(255,255,255,0.12) 0%, rgba(255,255,255,0) 60%);
+            pointer-events:none;
+            border-radius: var(--radius);
+        }
+
+        h1 { font-size: 3rem; margin-bottom:10px; font-weight:100; letter-spacing:4px; text-transform:uppercase; color: var(--text-light); }
+        h2 { font-size: 1.2rem; margin-bottom:25px; font-weight:300; letter-spacing:1.5px; color: var(--primary-color); }
+        p { font-size:1.15rem; line-height:1.7; margin-bottom:50px; color: var(--text-muted); font-weight:300; }
+
+        .btn-container { display:flex; justify-content:center; gap:30px; }
+        .btn {
+            padding:18px 45px;
+            border-radius:5px;
+            border:none;
+            font-size:1.05rem;
+            font-weight:500;
+            cursor:pointer;
+            transition: all var(--transition-speed) cubic-bezier(0.25,0.8,0.25,1);
+            text-decoration:none;
+            display:inline-block;
+            letter-spacing:1px;
+            text-transform:uppercase;
+            box-shadow: var(--shadow-btn);
+            position: relative;
+            overflow: hidden;
+        }
+        .btn::before {
+            content:'';
+            position:absolute; top:-50%; left:-50%; width:200%; height:200%;
+            background: rgba(255,255,255,0.1);
+            transform: rotate(45deg);
+            transition:none;
+        }
+        .btn:hover::before { transition: all 0.7s ease; top:-100%; left:-100%; opacity:0; }
+        .btn-login { background-color: var(--primary-color); color:white; }
+        .btn-login:hover { background-color:#a739c0; box-shadow:0 6px 20px rgba(156,39,176,0.6); transform:translateY(-2px); }
+        .btn-signup { background-color:transparent; border:2px solid var(--primary-color); color: var(--primary-color); }
+        .btn-signup:hover { background-color: var(--primary-color); color: var(--bg-start); box-shadow:0 6px 20px rgba(156,39,176,0.6); transform:translateY(-2px); }
+
+        footer {
+            position: fixed; bottom:0; width:100%;
+            background-color: rgba(0,0,0,0.2);
+            padding:15px;
+            text-align:center;
+            border-top:1px solid rgba(255,255,255,0.05);
+            backdrop-filter: blur(5px);
+        }
+        .footer-content { color:#777; font-size:0.85rem; font-weight:300; }
+        .footer-content a { color: var(--primary-color); text-decoration:none; transition:0.3s; }
+        .footer-content a:hover { color:#c447e0; }
+        .footer-content a:not(:last-child)::after { content: ' | '; color:#333; margin:0 10px; }
+
+        @media(max-width:650px){
+            .container{padding:60px 30px;}
+            h1{font-size:2.5rem; letter-spacing:2px;}
+            .btn-container{flex-direction:column; gap:15px;}
+            .btn{width:100%; padding:15px 25px; font-size:1rem;}
+            p{font-size:1rem;}
+            .footer-content{font-size:0.75rem;}
+            .footer-content span, .footer-content a{display:block; padding:5px 0;}
+            .footer-content a:not(:last-child)::after{content:none;}
+        }
+    </style>
+</head>
+<body>
+    <div class="container" id="main-content">
+        <h1>Domo-Connect</h1>
+        <h2>Smart Luxury & Secure Living</h2>
+        <p>Votre portail vers un <strong>confort</strong> et une <strong>sécurité</strong> inégalés. Domo-Connect vous offre le contrôle total de votre résidence intelligente, centralisé dans une interface <strong>élégante</strong> et <strong>intuitive</strong>.</p>
+        <div class="btn-container">
+            <a href="/login" class="btn btn-login">Se connecter</a>
+            <a href="/signup" class="btn btn-signup">Créer un compte</a>
+        </div>
+    </div>
+
+    <footer>
+        <div class="footer-content">
+            <p>Contact: <a href="mailto:support@domo-connect.com">support@domo-connect.com</a></p>
+            <a href="/legal">Mentions légales</a>
+            <a href="/privacy">Politique de confidentialité</a>
+            <span>&copy; 2025 Domo-Connect</span>
+        </div>
+    </footer>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const container = document.getElementById('main-content');
+            setTimeout(() => container.classList.add('loaded'), 100);
+        });
+    </script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include "sqlite3.h"
+
+#define PORT 8080
+#define SEUIL_PREDICTION 5  // alerte après 5 OFF
+
+// 🔹 Lecture de l'état d'un appareil
+void getEtat(sqlite3 *db, const char *nom, char *etat) {
+    const char *sql = "SELECT etat FROM etat_appareils WHERE appareil = ?;";
+    sqlite3_stmt *stmt;
+    strcpy(etat, "OFF");
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, nom, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char *val = sqlite3_column_text(stmt, 0);
+            strcpy(etat, (const char*)val);
+        }
+        sqlite3_finalize(stmt);
+    }
+}
+
+// 🔹 Met à jour l'état et incrémente compteur ON/OFF
+void majEtat(sqlite3 *db, const char *nom, const char *etat) {
+    char etatActuel[8];
+    getEtat(db, nom, etatActuel);
+
+    int incrementer_on = strcmp(etatActuel, "ON") != 0 && strcmp(etat, "ON") == 0;
+    int incrementer_off = strcmp(etatActuel, "OFF") != 0 && strcmp(etat, "OFF") == 0;
+
+    const char *sql;
+    if (incrementer_on) {
+        sql = "UPDATE etat_appareils SET etat = ?, dernier_changement = CURRENT_TIMESTAMP, compteur_on = compteur_on + 1 WHERE appareil = ?;";
+    } else if (incrementer_off) {
+        sql = "UPDATE etat_appareils SET etat = ?, dernier_changement = CURRENT_TIMESTAMP, compteur_off = compteur_off + 1 WHERE appareil = ?;";
+    } else {
+        sql = "UPDATE etat_appareils SET etat = ?, dernier_changement = CURRENT_TIMESTAMP WHERE appareil = ?;";
+    }
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, etat, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, nom, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            printf("❌ Erreur majEtat : %s\n", sqlite3_errmsg(db));
+        }
+        sqlite3_finalize(stmt);
+    }
+}
+
+// 🔹 Message prédiction selon compteur_off
+void getMessagePrediction(sqlite3 *db, const char *nom, char *message) {
+    const char *sql = "SELECT compteur_off FROM etat_appareils WHERE appareil = ?;";
+    sqlite3_stmt *stmt;
+    strcpy(message, "");
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, nom, -1, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            int compteur_off = sqlite3_column_int(stmt, 0);
+            if (compteur_off >= SEUIL_PREDICTION) {
+                sprintf(message, "⚠️ Attention, %s a été éteint %d fois !", nom, compteur_off);
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+}
+
+// 🔹 Réinitialiser compteurs
+void resetCompteur(sqlite3 *db, const char *nom) {
+    const char *sql = "UPDATE etat_appareils SET compteur_on = 0, compteur_off = 0 WHERE appareil = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, nom, -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+}
+
+// 🔹 Initialisation base
+void initDB(sqlite3 *db) {
+    char *errMsg = NULL;
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS etat_appareils ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "appareil TEXT UNIQUE, "
+        "etat TEXT, "
+        "compteur_on INTEGER DEFAULT 0, "
+        "compteur_off INTEGER DEFAULT 0, "
+        "dernier_changement DATETIME DEFAULT CURRENT_TIMESTAMP);";
+
+    if (sqlite3_exec(db, sql, NULL, NULL, &errMsg) != SQLITE_OK) {
+        printf("❌ Erreur création table : %s\n", errMsg);
+        sqlite3_free(errMsg);
+    } else {
+        printf("✅ Table prête.\n");
+    }
+
+    // Appareils initiaux
+    const char *insert1 = "INSERT OR IGNORE INTO etat_appareils (appareil, etat) VALUES ('lumiere','OFF');";
+    const char *insert2 = "INSERT OR IGNORE INTO etat_appareils (appareil, etat) VALUES ('volets','OFF');";
+    const char *insert3 = "INSERT OR IGNORE INTO etat_appareils (appareil, etat) VALUES ('clim','OFF');";
+
+    sqlite3_exec(db, insert1, NULL, NULL, &errMsg);
+    sqlite3_exec(db, insert2, NULL, NULL, &errMsg);
+    sqlite3_exec(db, insert3, NULL, NULL, &errMsg);
+}
+
+int main() {
+    WSADATA wsa;
+    SOCKET server_fd, new_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    char buffer[2048] = {0};
+    char response[8192];
+
+    sqlite3 *db;
+    if (sqlite3_open("etat_appareils.db", &db) != SQLITE_OK) {
+        printf("❌ Erreur ouverture base : %s\n", sqlite3_errmsg(db));
+        return 1;
+    }
+    sqlite3_busy_timeout(db, 5000);
+    printf("💾 Base connectée avec succès.\n");
+
+    initDB(db);
+
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) return 1;
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) return 1;
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) == SOCKET_ERROR) return 1;
+    if (listen(server_fd, 3) == SOCKET_ERROR) return 1;
+
+    printf("🌐 Serveur domotique prêt sur http://localhost:%d\n", PORT);
+
+    while (1) {
+        new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
+        if (new_socket == INVALID_SOCKET) continue;
+
+        memset(buffer, 0, sizeof(buffer));
+        recv(new_socket, buffer, sizeof(buffer), 0);
+        printf("\n🔹 Requête reçue : %s\n", buffer);
+
+        if (strstr(buffer, "favicon.ico")) { closesocket(new_socket); continue; }
+
+        // Actions ON/OFF
+        if (strstr(buffer, "lumiere=on")) majEtat(db, "lumiere", "ON");
+        if (strstr(buffer, "lumiere=off")) majEtat(db, "lumiere", "OFF");
+        if (strstr(buffer, "volets=ouvrir")) majEtat(db, "volets", "ON");
+        if (strstr(buffer, "volets=fermer")) majEtat(db, "volets", "OFF");
+        if (strstr(buffer, "clim=on")) majEtat(db, "clim", "ON");
+        if (strstr(buffer, "clim=off")) majEtat(db, "clim", "OFF");
+
+        // Boutons RESET
+        if (strstr(buffer, "lumiere=reset")) resetCompteur(db, "lumiere");
+        if (strstr(buffer, "volets=reset")) resetCompteur(db, "volets");
+        if (strstr(buffer, "clim=reset")) resetCompteur(db, "clim");
+
+        // Lecture états
+        char eLumiere[8], eVolets[8], eClim[8];
+        getEtat(db, "lumiere", eLumiere);
+        getEtat(db, "volets", eVolets);
+        getEtat(db, "clim", eClim);
+
+        // Messages prédiction
+        char msgLumiere[128], msgVolets[128], msgClim[128];
+        getMessagePrediction(db, "lumiere", msgLumiere);
+        getMessagePrediction(db, "volets", msgVolets);
+        getMessagePrediction(db, "clim", msgClim);
+
+        // 🔹 Lire fichier HTML
+        FILE *f = fopen("index.html", "r");
+        if (f) {
+            size_t n = fread(response, 1, sizeof(response)-1, f);
+            response[n] = 0;
+            fclose(f);
+
+            // Copier le HTML dans une page temporaire pour remplacer les placeholders
+            char page[8192];
+            strcpy(page, response);
+
+            // Remplacer les placeholders
+            char *p;
+
+            p = strstr(page, "{{LUMIERE_ETAT}}");
+            if (p) snprintf(p, 16, "%s", eLumiere);
+            p = strstr(page, "{{LUMIERE_ALERT}}");
+            if (p) snprintf(p, 128, "%s", msgLumiere);
+
+            p = strstr(page, "{{VOLETS_ETAT}}");
+            if (p) snprintf(p, 16, "%s", eVolets);
+            p = strstr(page, "{{VOLETS_ALERT}}");
+            if (p) snprintf(p, 128, "%s", msgVolets);
+
+            p = strstr(page, "{{CLIM_ETAT}}");
+            if (p) snprintf(p, 16, "%s", eClim);
+            p = strstr(page, "{{CLIM_ALERT}}");
+            if (p) snprintf(p, 128, "%s", msgClim);
+
+            // 🔹 Envoyer la page finale
+            char buffer_final[8192];
+            snprintf(buffer_final, sizeof(buffer_final),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/html; charset=UTF-8\r\n\r\n%s", page);
+
+            send(new_socket, buffer_final, strlen(buffer_final), 0);
+        } else {
+            const char *err = "HTTP/1.1 500 Internal Server Error\r\n\r\nErreur: impossible de lire index.html";
+            send(new_socket, err, strlen(err), 0);
+        }
+
+        closesocket(new_socket);
+    }
+
+    closesocket(server_fd);
+    sqlite3_close(db);
+    WSACleanup();
+    return 0;
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    

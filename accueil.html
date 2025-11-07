@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-width=1.0" />
+<title>Domo-Connect — Tableau de Bord</title>
+<style>
+/* Votre style CSS est conservé */
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Segoe UI',Tahoma,sans-serif;background:linear-gradient(145deg,#0c0c12,#1b1b26);color:#e0e0e0;min-height:100vh;padding:20px;}
+.hidden{display:none;}
+header{display:flex;justify-content:space-between;align-items:center;padding:25px 40px;background:rgba(139,0,255,0.1);border-radius:15px;margin-bottom:30px;backdrop-filter:blur(10px);border:1px solid rgba(139,0,255,0.2);}
+.deconnexion{background:linear-gradient(135deg,#8b00ff,#6200ea);color:white;padding:12px 28px;border-radius:8px;cursor:pointer;}
+.accueil-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:25px;max-width:1400px;margin:0 auto;}
+.module{background:rgba(30,30,46,0.8);border-radius:15px;padding:25px;border:1px solid rgba(139,0,255,0.2);box-shadow:0 8px 32px rgba(0,0,0,0.3);}
+.module h2{color:#bb86fc;margin-bottom:20px;font-size:1.5rem;border-bottom:2px solid rgba(139,0,255,0.3);padding-bottom:10px;}
+.status-btn{border:2px solid;padding:8px 20px;border-radius:20px;font-weight:600;font-size:0.9rem;min-width:80px;background:transparent;cursor:pointer;transition:all 0.2s ease;}
+.status-btn.off{color:#ff6b6b;border-color:#ff6b6b;background:rgba(255,107,107,0.1);}
+.status-btn.on{color:#bb86fc;border-color:#bb86fc;background:rgba(187,134,252,0.1);} 
+.module table{width:100%;border-collapse:collapse;}
+.module td{padding:12px;font-size:0.95rem;}
+.module td:first-child{color:#c0c0c0;}
+.module td:last-child{text-align:right;}
+.reset-btn{display:block;margin:40px auto;padding:12px 30px;background:linear-gradient(135deg,#ff7e5f,#feb47b);border:none;border-radius:10px;font-size:1rem;color:#1b1b26;font-weight:600;cursor:pointer;}
+.deconnexion-container{display:flex;justify-content:center;align-items:center;min-height:100vh;}
+.deconnexion-card{background:rgba(30,30,46,0.9);border-radius:20px;padding:60px;text-align:center;border:2px solid rgba(139,0,255,0.3);box-shadow:0 20px 60px rgba(139,0,255,0.3);}
+.deconnexion-card h1{font-size:3rem;color:#bb86fc;margin-bottom:10px;}
+.btn-retour{display:inline-block;background:linear-gradient(135deg,#8b00ff,#6200ea);color:#fff;text-decoration:none;padding:15px 35px;border-radius:10px;font-size:1.1rem;}
+</style>
+</head>
+<body onload="fetchInitialStates()"> <div id="page-accueil" class="accueil-container">
+  <header class="main-header">
+    <h1>Bonjour <span id="user-name">Admin</span></h1>
+    <button class="deconnexion" onclick="showLogout()">Se Déconnecter</button>
+  </header>
+
+  <div class="module">
+    <h2>💡 Luminaires RDC</h2>
+    <table>
+      <tr><td>Cuisine - Luminaire entrée</td><td><button id="Cuisine - Luminaire entrée" class="status-btn off" onclick="toggleDevice(this, 'light', 'Cuisine - Luminaire entrée')">OFF</button></td></tr>
+      <tr><td>Cuisine - Luminaire îlot central</td><td><button id="Cuisine - Luminaire îlot central" class="status-btn off" onclick="toggleDevice(this, 'light', 'Cuisine - Luminaire îlot central')">OFF</button></td></tr>
+      <tr><td>Salon - Luminaire salon nord</td><td><button id="Salon - Luminaire salon nord" class="status-btn off" onclick="toggleDevice(this, 'light', 'Salon - Luminaire salon nord')">OFF</button></td></tr>
+      <tr><td>Salon - Applique cheminée sud</td><td><button id="Salon - Applique cheminée sud" class="status-btn off" onclick="toggleDevice(this, 'light', 'Salon - Applique cheminée sud')">OFF</button></td></tr>
+      <tr><td>Salle à manger - Luminaire central</td><td><button id="Salle à manger - Luminaire central" class="status-btn off" onclick="toggleDevice(this, 'light', 'Salle à manger - Luminaire central')">OFF</button></td></tr>
+      <tr><td>WC RDC - Luminaire central</td><td><button id="WC - Luminaire central" class="status-btn off" onclick="toggleDevice(this, 'light', 'WC - Luminaire central')">OFF</button></td></tr>
+      <tr><td>Hall nord - Luminaire central</td><td><button id="Hall nord - Luminaire central" class="status-btn off" onclick="toggleDevice(this, 'light', 'Hall nord - Luminaire central')">OFF</button></td></tr>
+    </table>
+  </div>
+
+  <div class="module">
+    <h2>🚪 Volets & Portes RDC</h2>
+    <table>
+      <tr><td>Hall nord - Volet roulant grande baie vitrée</td><td><button id="Hall nord - Volet roulant grande baie vitrée" class="status-btn off" onclick="toggleDevice(this, 'store', 'Hall nord - Volet roulant grande baie vitrée')">OFF</button></td></tr>
+      <tr><td>Salon - Volet roulant fenêtre sud</td><td><button id="Salon - Volet roulant fenêtre sud" class="status-btn off" onclick="toggleDevice(this, 'store', 'Salon - Volet roulant fenêtre sud')">OFF</button></td></tr>
+      <tr><td>Cuisine - Volet roulant porte fenêtre terrasse</td><td><button id="Cuisine - Volet roulant porte fenêtre terrasse" class="status-btn off" onclick="toggleDevice(this, 'store', 'Cuisine - Volet roulant porte fenêtre terrasse')">OFF</button></td></tr>
+      <tr><td>Garage Nord - Porte basculante nord</td><td><button id="Garages nord - Porte basculante nord" class="status-btn off" onclick="toggleDevice(this, 'store', 'Garages nord - Porte basculante nord')">OFF</button></td></tr>
+      <tr><td>Garage Ouest - Porte basculante ouest</td><td><button id="Garages ouest - Porte basculante ouest" class="status-btn off" onclick="toggleDevice(this, 'store', 'Garages ouest - Porte basculante ouest')">OFF</button></td></tr>
+    </table>
+  </div>
+
+  <div class="module">
+    <h2>🛏️ Luminaires Étages</h2>
+    <table>
+      <tr><td>Suite parentale - Luminaire central</td><td><button id="Suite parentale - Luminaire central" class="status-btn off" onclick="toggleDevice(this, 'light', 'Suite parentale - Luminaire central')">OFF</button></td></tr>
+      <tr><td>Chambre invités - Luminaire central</td><td><button id="Chambre invités - Luminaire central" class="status-btn off" onclick="toggleDevice(this, 'light', 'Chambre invités - Luminaire central')">OFF</button></td></tr>
+      <tr><td>Bureau - Luminaire central</td><td><button id="Bureau - Luminaire central" class="status-btn off" onclick="toggleDevice(this, 'light', 'Bureau - Luminaire central')">OFF</button></td></tr>
+      <tr><td>Chambre N-E - Luminaire central</td><td><button id="Chambre nord est - Luminaire central" class="status-btn off" onclick="toggleDevice(this, 'light', 'Chambre nord est - Luminaire central')">OFF</button></td></tr>
+      <tr><td>SDB N-E - Luminaire central</td><td><button id="Chambre nord est - Salle de bain - Luminaire central" class="status-btn off" onclick="toggleDevice(this, 'light', 'Chambre nord est - Salle de bain - Luminaire central')">OFF</button></td></tr>
+      <tr><td>Salle de jeux - Luminaire central nord</td><td><button id="Salle de jeux - Luminaire central nord" class="status-btn off" onclick="toggleDevice(this, 'light', 'Salle de jeux - Luminaire central nord')">OFF</button></td></tr>
+    </table>
+  </div>
+
+  <div class="module">
+    <h2>⚙️ Systèmes Génériques & Tests</h2>
+    <table>
+      <tr><td>Contrôle Lumière Générique</td><td><button id="lumiere" class="status-btn off" onclick="toggleDevice(this, 'light', 'lumiere')">OFF</button></td></tr>
+      <tr><td>Contrôle Volets Générique</td><td><button id="volets" class="status-btn off" onclick="toggleDevice(this, 'store', 'volets')">OFF</button></td></tr>
+      <tr><td>Contrôle Climatisation Générique</td><td><button id="clim" class="status-btn off" onclick="toggleDevice(this, 'climate', 'clim')">OFF</button></td></tr>
+    </table>
+  </div>
+
+  <button class="reset-btn" onclick="resetDB()">🔄 Réinitialiser la base</button>
+</div>
+
+<div id="page-logout" class="hidden">
+  <div class="deconnexion-container">
+    <div class="deconnexion-card">
+      <h1>À bientôt 👋</h1>
+      <p>Vous avez été déconnecté avec succès</p>
+      <a href="#" class="btn-retour" onclick="showAccueil()">Retour au tableau de bord</a>
+    </div>
+  </div>
+</div>
+
+<script>
+const dashPage = document.getElementById('page-accueil');
+const logoutPage = document.getElementById('page-logout');
+
+// =========================================================
+// GESTION DES PAGES (Logout/Accueil)
+// =========================================================
+function showLogout(){
+  dashPage.classList.add('hidden');
+  logoutPage.classList.remove('hidden');
+}
+
+function showAccueil(){
+  logoutPage.classList.add('hidden');
+  dashPage.classList.remove('hidden');
+}
+
+// =========================================================
+// SYNCHRONISATION DES ÉTATS (NOUVEAU)
+// =========================================================
+
+// Fonction pour mettre à jour un bouton spécifique
+function updateButtonState(name, state) {
+    const btn = document.getElementById(name);
+    if (!btn) return;
+
+    btn.classList.remove('on', 'off');
+    
+    if (state.toUpperCase() === 'ON') {
+        btn.classList.add('on');
+        btn.textContent = 'ON';
+    } else {
+        btn.classList.add('off');
+        btn.textContent = 'OFF';
+    }
+}
+
+
+// Récupère l'état initial des appareils génériques pour l'exemple
+function fetchInitialStates() {
+    // Liste des appareils dont nous voulons récupérer l'état au chargement
+    // NOTE : Le serveur C ne renvoie pas nativement TOUS les 96 états
+    // Il faut donc les chercher appareil par appareil ou modifier le serveur C.
+    // Pour l'instant, on se base sur l'état général des appareils génériques de test.
+    
+    // Pour la synchronisation de tous les appareils, chaque bouton doit avoir un ID 
+    // correspondant exactement à son nom (ce qui est fait ci-dessus).
+
+    // Pour l'instant, on va chercher l'état de nos 3 appareils génériques (pour le test)
+    fetch('/state')
+        .then(r => {
+            if (!r.ok) throw new Error('Erreur réseau');
+            return r.text();
+        })
+        .then(data => {
+            // Exemple de données reçues: lumiere=ON;volets=OFF;clim=OFF
+            const pairs = data.split(';');
+            pairs.forEach(pair => {
+                const [name, state] = pair.split('=');
+                if (name && state) {
+                    updateButtonState(name, state); // Met à jour 'lumiere', 'volets', 'clim'
+                }
+            });
+        })
+        .catch(e => {
+            console.error('Erreur chargement états initiaux:', e);
+            // Si la connexion échoue, on suppose que le serveur est down
+            alert("Erreur de connexion au serveur C. Veuillez vérifier si domoserver.exe est lancé.");
+        });
+        
+    // Pour synchroniser l'ensemble des 96 appareils, 
+    // il faudrait implémenter une route '/all-states' dans domoserver.c
+    // qui renverrait un JSON ou un format lisible de tous les états.
+}
+
+
+// =========================================================
+// CONTRÔLE DES APPAREILS
+// =========================================================
+
+// 🔁 Réinitialisation de la base
+function resetDB(){
+  fetch('/reset-db')
+    .then(r => r.text())
+    .then(txt => {
+        alert(txt + "\n\n(Veuillez recharger la page pour synchroniser)");
+        fetchInitialStates(); // Tente de re-synchroniser après le reset
+    })
+    .catch(e => alert('Erreur lors de la réinitialisation : ' + e));
+}
+
+// 💡 Fonction pour gérer le changement d'état d'un appareil
+function toggleDevice(btn, type, name){
+  let newState;
+  // Déterminer le nouvel état
+  if(btn.classList.contains('off')){
+    newState='ON';
+  } else {
+    newState='OFF';
+  }
+  
+  // Mettre à jour l'affichage immédiatement 
+  updateButtonState(name, newState); // Utilisation de la fonction centralisée
+  
+  console.log(`Sending: /update?type=${type}&nom=${name}&etat=${newState}`);
+
+  // Envoi de la requête au serveur C (domoserver.exe)
+  fetch(`/update?type=${type}&nom=${encodeURIComponent(name)}&etat=${newState}`)
+    .then(r => r.text())
+    .then(txt => {
+        console.log('Server response:', txt);
+        if (txt.includes("Missing params") || txt.includes("400 Bad Request")) {
+             console.error('Erreur: Le serveur n\'a pas traité la commande.');
+             alert('Erreur: Le serveur n\'a pas traité la commande (mauvais nom d\'appareil?).');
+             // Revenir à l'état précédent en cas de Bad Request
+             updateButtonState(name, (newState === 'ON' ? 'OFF' : 'ON'));
+        }
+    })
+    .catch(e => {
+        console.error('Erreur de communication avec le serveur:', e);
+        alert(`Erreur de connexion (domoserver.exe non lancé ou port occupé).`);
+        // Revenir à l'état précédent en cas d'échec de la requête
+        updateButtonState(name, (newState === 'ON' ? 'OFF' : 'ON'));
+    });
+}
+</script>
+
+</body>
+</html>
